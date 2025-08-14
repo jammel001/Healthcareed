@@ -6,3 +6,4 @@ reportlab
 gunicorn
 werkzeug
 rapidfuzz
+flask_session
