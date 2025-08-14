@@ -8,3 +8,4 @@ werkzeug
 rapidfuzz
 flask_session
 sklearn
+scikit-learn
