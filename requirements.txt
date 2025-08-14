@@ -5,3 +5,4 @@ joblib
 reportlab
 gunicorn
 werkzeug
+rapidfuzz
