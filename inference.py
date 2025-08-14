@@ -1,4 +1,4 @@
-import os, io, json
+import os, io
 from datetime import datetime
 from typing import List, Dict, Any
 
@@ -7,9 +7,12 @@ from flask import Flask, request, jsonify, send_file, render_template_string, se
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 import joblib
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.lib.units import mm
+
+# Optional fuzzy matching for typos
+try:
+    from rapidfuzz import fuzz
+except ImportError:
+    fuzz = None
 
 # -----------------------------
 # App setup
@@ -31,7 +34,8 @@ class ModelBundle:
         self.symptom_index = model_dict.get('symptom_index', {})
         self.disease_index = model_dict.get('disease_index', {})
         self.disease_info = model_dict.get('disease_info', {})
-        # embeddings
+
+        # Embeddings for symptom matching
         self.vocab = list(symptom_embeddings.get('vocab', [])) if symptom_embeddings else []
         self.vectors = symptom_embeddings.get('vectors', None) if symptom_embeddings else None
         if isinstance(self.vectors, np.ndarray) and self.vectors.size > 0:
@@ -42,10 +46,10 @@ class ModelBundle:
     def predict(self, symptoms: List[str]) -> Dict[str, Any]:
         if self.clf is None or not self.symptom_index:
             return {
-                "condition": "Insufficient model artifacts",
-                "proba": 0.0,
+                "condition": "Model not available",
+                "proba": None,
                 "matched_symptoms": [],
-                "advice": "Model or indices not found. Please rebuild and redeploy.",
+                "advice": "Please redeploy with a trained model.",
                 "precautions": []
             }
         canonical = self.match_symptoms(symptoms)
@@ -64,18 +68,12 @@ class ModelBundle:
                 top_idx = int(self.clf.predict(x)[0])
                 proba = None
         except Exception:
-            if hasattr(self.clf, "decision_function"):
-                scores = self.clf.decision_function(x)
-                top_idx = int(np.argmax(scores[0]))
-                proba = None
-            else:
-                top_idx = 0
-                proba = None
+            top_idx, proba = 0, None
 
         condition = self.decode_condition(top_idx)
-        info = self.disease_info.get(condition, {}) if isinstance(self.disease_info, dict) else {}
-        advice = info.get('advice', 'Stay hydrated, rest, and monitor your symptoms. Seek medical help if they worsen.')
-        precautions = info.get('precautions', ['Stay hydrated', 'Rest well', 'Monitor temperature'])
+        info = self.disease_info.get(condition, {})
+        advice = info.get('advice', 'Stay hydrated and rest.')
+        precautions = info.get('precautions', ['Stay hydrated', 'Rest well'])
 
         return {
             "condition": condition,
@@ -94,13 +92,11 @@ class ModelBundle:
 
     def match_symptoms(self, raw_symptoms: List[str]) -> List[str]:
         if self.vectors is None or not self.vocab:
-            tokens = [t.strip().lower() for s in raw_symptoms for t in s.replace(';', ',').split(',')]
-            return [t for t in tokens if t in self.symptom_index]
+            return [t for s in raw_symptoms for t in s.split(',') if t in self.symptom_index]
 
         matched = []
         for s in raw_symptoms:
-            terms = [w.strip().lower() for w in s.replace(';', ',').split(',') if w.strip()]
-            for term in terms:
+            for term in [w.strip().lower() for w in s.split(',') if w.strip()]:
                 v = embed_text(term)
                 if v is None: 
                     continue
@@ -110,16 +106,7 @@ class ModelBundle:
                 if sims[best_idx] >= 0.45:
                     matched.append(self.vocab[best_idx])
 
-        # dedupe
-        seen, canonical = set(), []
-        for m in matched:
-            if m not in seen:
-                seen.add(m)
-                canonical.append(m)
-        if not canonical:
-            tokens = [t.strip().lower() for s in raw_symptoms for t in s.replace(';', ',').split(',')]
-            canonical = [t for t in tokens if t in self.symptom_index]
-        return canonical
+        return list(dict.fromkeys(matched))  # dedupe
 
 def embed_text(text: str, dim: int = 300) -> np.ndarray:
     rng = np.random.default_rng(abs(hash(text)) % (2**32))
@@ -140,7 +127,7 @@ def load_bundle() -> ModelBundle:
 BUNDLE = load_bundle()
 
 # -----------------------------
-# Conversation state helpers
+# Conversation state
 # -----------------------------
 def init_state():
     session.setdefault('stage', 'greet')
@@ -149,96 +136,68 @@ def init_state():
     session.setdefault('last_result', None)
     session.setdefault('pending_suggestion', None)
 
-def reset_state():
-    session.clear()
-    init_state()
+# -----------------------------
+# Suggestion helper
+# -----------------------------
+def suggest_nearest(term: str, bundle: ModelBundle) -> str:
+    if fuzz:
+        candidates = list(bundle.symptom_index.keys())
+        best, score = max(((c, fuzz.ratio(term, c))) for c in candidates)
+        return best if score >= 70 else ""
+    return ""
 
 # -----------------------------
-# Minimal UI (optional)
+# Frontend
 # -----------------------------
 HOME_HTML = """
 <!doctype html>
 <html>
 <head>
+  <title>CareGuide AI</title>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>CareGuide AI</title>
   <style>
-    body{font-family: system-ui; margin:0; background:#0f172a; color:#e2e8f0}
-    .wrap{max-width:900px; margin:0 auto; padding:24px}
-    .card{background:#111827; border-radius:16px; padding:20px; box-shadow:0 10px 30px rgba(0,0,0,.25)}
-    h1{margin:0 0 8px 0}
-    .attribution{font-size:14px; opacity:.8; margin-bottom:12px}
-    .chat{height:50vh; overflow:auto; border:1px solid #1f2937; border-radius:12px; padding:12px; background:#0b1220}
-    .msg{margin:8px 0;}
+    body{font-family:system-ui;background:#0f172a;color:#e2e8f0;margin:0}
+    .wrap{max-width:900px;margin:0 auto;padding:24px}
+    .card{background:#111827;padding:20px;border-radius:16px}
+    .chat{height:50vh;overflow:auto;background:#0b1220;padding:12px;border-radius:12px}
+    .msg{margin:8px 0}
     .ai{color:#a7f3d0}
-    .user{color:#93c5fd; text-align:right}
-    .row{display:flex; gap:8px; margin-top:12px}
-    input{flex:1; background:#0b1220; border:1px solid #1f2937; color:#e5e7eb; padding:10px; border-radius:10px}
-    button{background:#22c55e; color:#052e16; border:none; padding:10px 14px; border-radius:10px; font-weight:700; cursor:pointer}
-    .download{background:#38bdf8; color:#06263a}
+    .user{color:#93c5fd;text-align:right}
+    .row{display:flex;gap:8px;margin-top:12px}
+    input{flex:1;background:#0b1220;color:#fff;padding:10px;border:1px solid #1f2937;border-radius:10px}
+    button{background:#22c55e;color:#052e16;border:none;padding:10px 14px;border-radius:10px;font-weight:700}
+    .download{background:#38bdf8;color:#06263a;display:none}
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="card">
-      <h1>CareGuide AI</h1>
-      <div class="attribution">Built by <strong>Bara'u Magaji</strong>, <strong>Aliyu Muhammad Abdul</strong>, and <strong>Aliyu Biniyaminu</strong>.</div>
-      <div class="chat" id="chat"></div>
-      <div class="row">
-        <input id="input" placeholder="Type your reply here..." />
-        <button onclick="send()">Send</button>
-      </div>
-      <div class="row">
-        <button class="download" onclick="downloadPdf()">Download last prescription (PDF)</button>
-      </div>
+<div class="wrap">
+  <div class="card">
+    <h1>CareGuide AI</h1>
+    <div class="chat" id="chat"></div>
+    <div class="row">
+      <input id="input" placeholder="Type here..." />
+      <button onclick="send()">Send</button>
+    </div>
+    <div class="row">
+      <button class="download" onclick="downloadPdf()">Download last prescription (PDF)</button>
     </div>
   </div>
+</div>
 <script>
-const chat = document.getElementById('chat');
-const input = document.getElementById('input');
-
-function append(role, text){
-  const div = document.createElement('div');
-  div.className = 'msg ' + role;
-  div.textContent = text;
-  chat.appendChild(div);
-  chat.scrollTop = chat.scrollHeight;
-}
-
-async function boot(){
-  const r = await fetch('/api/boot');
-  const j = await r.json();
-  append('ai', j.message);
-}
-
+const chat=document.getElementById('chat');const input=document.getElementById('input');
+function append(role,text){const div=document.createElement('div');div.className='msg '+role;div.textContent=text;chat.appendChild(div);chat.scrollTop=chat.scrollHeight;}
+async function boot(){const r=await fetch('/api/boot');const j=await r.json();append('ai',j.message);}
 async function send(){
-  const msg = input.value.trim();
-  if(!msg) return;
-  append('user', msg);
-  input.value = '';
-  const r = await fetch('/api/message', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({ message: msg })
-  });
-  const j = await r.json();
-  if(j.ask_confirm && j.suggestion){
-    append('ai', j.message + `\nDid you mean: "${j.suggestion}"? (yes/no)`);
-  } else {
-    append('ai', j.message);
-  }
+  const msg=input.value.trim();if(!msg)return;
+  append('user',msg);input.value='';
+  append('ai',"Thinking...");
+  const r=await fetch('/api/message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg})});
+  const j=await r.json();chat.lastChild.remove();
+  append('ai',j.message);
+  if(j.pdf_ready)document.querySelector('.download').style.display='block';
 }
-
-async function downloadPdf(){
-  const r = await fetch('/api/has_result');
-  const j = await r.json();
-  if(!j.ok){
-    append('ai', 'No prescription available yet. Please complete a prediction first.');
-    return;
-  }
-  window.location.href = '/download_pdf';
-}
-
+async function downloadPdf(){window.location.href='/download_pdf';}
 boot();
 </script>
 </body>
@@ -251,191 +210,104 @@ def home():
     return render_template_string(HOME_HTML)
 
 # -----------------------------
-# Conversation API
+# API
 # -----------------------------
 @app.route('/api/boot')
 def api_boot():
     init_state()
-    # Order requested: greet + show builders → ask for feelings first → later ask details
-    msg = (
-        "Hello! I'm CareGuide AI.\n"
-        "This assistant was built by Bara'u Magaji, Aliyu Muhammad Abdul, and Aliyu Biniyaminu.\n\n"
-        "Please describe how you're feeling (e.g., 'fever, sore throat, headache'). "
-        "You can list multiple symptoms separated by commas. When you're done, type 'done'."
-    )
-    session['stage'] = 'ask_symptoms'  # start with symptoms
-    return jsonify({"message": msg})
+    session['stage'] = 'ask_symptoms'
+    return jsonify({"message": "Hello! Please list your symptoms separated by commas."})
 
 @app.route('/api/message', methods=['POST'])
 def api_message():
     init_state()
     data = request.get_json(force=True)
     text = (data.get('message') or '').strip()
-    stage = session.get('stage', 'ask_symptoms')
+    stage = session['stage']
 
-    # Handle pending yes/no for suggestion
-    pending = session.get('pending_suggestion')
-    if pending:
-        if text.lower() in ('yes', 'y'):
-            syms = session.get('symptoms', [])
-            if pending not in syms:
-                syms.append(pending)
-            session['symptoms'] = syms
+    # Handle pending suggestion
+    if session.get('pending_suggestion'):
+        if text.lower() in ['yes','y']:
+            session['symptoms'].append(session['pending_suggestion'])
             session['pending_suggestion'] = None
-            return jsonify({"message": "Thanks, added. Any other symptoms? If you're done, type 'done'."})
-        elif text.lower() in ('no', 'n'):
+            return jsonify({"message": "Added. Any other symptoms? Or type 'done'."})
+        elif text.lower() in ['no','n']:
             session['pending_suggestion'] = None
-            return jsonify({"message": "Okay, please rephrase or add a different symptom."})
-        # otherwise continue below
+            return jsonify({"message": "Okay, please type the correct symptom."})
 
     if stage == 'ask_symptoms':
-        if text.lower() in ('done', 'finish', 'end', 'no'):
-            if not session.get('symptoms'):
-                return jsonify({"message": "I don’t have any symptoms yet. Please add at least one before typing 'done'."})
+        if text.lower() == 'done':
+            if not session['symptoms']:
+                return jsonify({"message": "Please add at least one symptom before continuing."})
             session['stage'] = 'ask_name'
-            return jsonify({"message": "Got it. Before I advise you, may I have your full name?"})
-        else:
-            # extract tokens and suggest nearest if unknown
-            tokens = [t.strip().lower() for t in text.replace(';', ',').split(',') if t.strip()]
-            accepted = []
-            for term in tokens:
-                if term in BUNDLE.symptom_index:
-                    accepted.append(term)
-                else:
-                    suggestion = suggest_nearest(term, BUNDLE)
-                    if suggestion:
-                        session['pending_suggestion'] = suggestion
-                        return jsonify({
-                            "message": f"I didn't recognize '{term}'.",
-                            "ask_confirm": True,
-                            "suggestion": suggestion
-                        })
-            if accepted:
-                syms = session.get('symptoms', [])
-                for a in accepted:
-                    if a not in syms:
-                        syms.append(a)
-                session['symptoms'] = syms
-                return jsonify({"message": "Noted: " + ", ".join(accepted) + ". Add more or type 'done' to continue."})
-            return jsonify({"message": "Thanks. Add more symptoms or type 'done' to proceed."})
+            return jsonify({"message": "Got it. What’s your full name?"})
+        tokens = [t.strip().lower() for t in text.split(',')]
+        for term in tokens:
+            if term in BUNDLE.symptom_index:
+                session['symptoms'].append(term)
+            else:
+                suggestion = suggest_nearest(term, BUNDLE)
+                if suggestion:
+                    session['pending_suggestion'] = suggestion
+                    return jsonify({"message": f"Did you mean '{suggestion}'?"})
+        return jsonify({"message": "Symptoms noted. Add more or type 'done'."})
 
     if stage == 'ask_name':
-        session.setdefault('patient', {})['name'] = text
+        session['patient']['name'] = text
         session['stage'] = 'ask_age'
         return jsonify({"message": f"Thanks {text}. How old are you?"})
 
     if stage == 'ask_age':
-        age_num = ''.join(ch for ch in text if ch.isdigit())
-        session['patient']['age'] = int(age_num) if age_num.isdigit() else None
+        session['patient']['age'] = int(''.join(filter(str.isdigit, text)))
         session['stage'] = 'ask_gender'
-        return jsonify({"message": "What is your gender? (male/female/other)"})
+        return jsonify({"message": "What is your sex? (male/female/other)"})
 
     if stage == 'ask_gender':
         session['patient']['gender'] = text.lower()
-        # Predict now
-        syms = session.get('symptoms', [])
-        result = BUNDLE.predict(syms)
+        result = BUNDLE.predict(session['symptoms'])
         session['last_result'] = {
-            "patient": session.get('patient', {}),
-            "symptoms": syms,
-            "result": result,
-            "timestamp": datetime.utcnow().isoformat() + "Z"
+            "patient": session['patient'],
+            "symptoms": session['symptoms'],
+            "result": result
         }
-        session['stage'] = 'done'
         cond = result['condition']
-        proba_txt = f" (confidence {result['proba']:.0%})" if result['proba'] is not None else ""
-        advice = result['advice']
-        precautions = result.get('precautions', [])
-        extra = ("\nPrecautions: " + ", ".join(precautions)) if precautions else ""
-        return jsonify({"message":
-            f"Thank you. Based on your symptoms, you may be experiencing: {cond}{proba_txt}.\n\n"
-            f"Advice: {advice}{extra}\n\n"
-            f"If you want, click 'Download last prescription (PDF)'."
-        })
+        proba_txt = f" (confidence {result['proba']:.0%})" if result['proba'] else ""
+        msg = f"Based on your symptoms, you may have: {cond}{proba_txt}.\n\nAdvice: {result['advice']}\nPrecautions: {', '.join(result['precautions'])}"
+        return jsonify({"message": msg, "pdf_ready": True})
 
-    return jsonify({"message": "We’ve completed your assessment. You can refresh to start over."})
-
-def suggest_nearest(term: str, bundle: ModelBundle) -> str:
-    if bundle.vectors is None or not bundle.vocab:
-        # simple fallback: character Jaccard
-        candidates = list(bundle.symptom_index.keys())
-        term_l = term.lower()
-        best, best_score = "", 0.0
-        for c in candidates:
-            score = jaccard_chars(term_l, c.lower())
-            if score > best_score:
-                best, best_score = c, score
-        return best if best_score >= 0.5 else ""
-    v = embed_text(term)
-    v = v / (np.linalg.norm(v) + 1e-12)
-    sims = bundle.vectors @ v
-    idx = int(np.argmax(sims))
-    return bundle.vocab[idx] if sims[idx] >= 0.45 else ""
-
-def jaccard_chars(a: str, b: str) -> float:
-    sa, sb = set(a), set(b)
-    inter = len(sa & sb)
-    union = len(sa | sb) or 1
-    return inter / union
-
-@app.route('/api/has_result')
-def api_has_result():
-    return jsonify({"ok": bool(session.get('last_result'))})
+    return jsonify({"message": "Session complete. Refresh to start again."})
 
 @app.route('/download_pdf')
 def download_pdf():
     lr = session.get('last_result')
     if not lr:
         return jsonify({"error": "No result available."}), 400
-
     buf = io.BytesIO()
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import mm
     c = canvas.Canvas(buf, pagesize=A4)
     W, H = A4
     y = H - 20*mm
-
-    def line(txt, step=7):
-        nonlocal y
-        c.drawString(20*mm, y, txt)
-        y -= step*mm
-
-    c.setTitle("CareGuide AI — Prescription")
-    c.setFont("Helvetica-Bold", 14); line("CareGuide AI — Well-Being Guidance")
+    def line(txt, step=7): nonlocal y; c.drawString(20*mm, y, txt); y -= step*mm
+    c.setFont("Helvetica-Bold", 14); line("CareGuide AI — Prescription")
     c.setFont("Helvetica", 10)
-    line("Built by: Bara'u Magaji, Aliyu Muhammad Abdul, Aliyu Biniyaminu"); line("")
-
-    p = lr.get('patient', {})
-    line(f"Patient: {p.get('name','N/A')}    Age: {p.get('age','N/A')}    Sex: {p.get('sex','N/A')}")
-    line(f"Date (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} "); line("")
-
-    syms = lr.get('symptoms', [])
-    line("Reported Symptoms:")
-    for s in syms: line(f" • {s}")
-    line("")
-
-    r = lr.get('result', {})
-    condition = r.get('condition', 'N/A')
-    proba = r.get('proba')
-    line(f"Likely Condition: {condition}")
-    if proba is not None: line(f"Confidence: {proba:.0%}")
-    line("")
-
-    from textwrap import wrap
-    advice = r.get('advice', '')
-    precautions = r.get('precautions', [])
-    line("Advice:")
-    for chunk in wrap(advice, 90): line(chunk)
-    if precautions:
-        line(""); line("Precautions:")
-        for pz in precautions: line(f" • {pz}")
-
-    line(""); line("This guidance is informational and not a medical diagnosis.")
+    p = lr['patient']
+    line(f"Patient: {p.get('name','N/A')}    Age: {p.get('age','N/A')}    Sex: {p.get('gender','N/A')}")
+    line(f"Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"); line("")
+    line("Symptoms:"); [line(f" - {s}") for s in lr['symptoms']]
+    r = lr['result']
+    line(f"Likely Condition: {r['condition']}")
+    if r['proba']: line(f"Confidence: {r['proba']:.0%}")
+    line("Advice:"); [line(f" - {t}") for t in r['advice'].split('. ') if t]
+    line("Precautions:"); [line(f" - {p}") for p in r['precautions']]
     c.showPage(); c.save(); buf.seek(0)
-
-    filename = f"careguide_prescription_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
+    filename = f"careguide_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
     return send_file(buf, as_attachment=True, download_name=filename, mimetype="application/pdf")
 
 @app.route('/health')
-def health(): return jsonify({"status": "ok"})
+def health(): 
+    return jsonify({"status": "ok"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
