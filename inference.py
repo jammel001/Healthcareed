@@ -280,8 +280,10 @@ GUIDE_HTML = """
 # =============================
 # Routes
 # =============================
+
 @app.route('/')
 def home():
+    # Initialize only when visiting home
     init_state()
     return render_template_string(HOME_HTML)
 
@@ -291,6 +293,7 @@ def guidelines():
 
 @app.route('/api/boot')
 def api_boot():
+    # Initialize only when booting the chat
     init_state()
     session['stage'] = 'ask_symptoms'
     msg = (
@@ -314,31 +317,27 @@ def suggest_terms(term: str) -> List[str]:
     candidates = list(BUNDLE.symptom_index.keys())
     if not candidates:
         return []
-    # top-3 suggestions if score >= 65
     matches = process.extract(term, candidates, limit=3, score_cutoff=65)
     return [m[0] for m in matches]
 
 # ---------- conversation ----------
 @app.route('/api/message', methods=['POST'])
 def api_message():
-    init_state()
+    # ❌ Removed init_state() here — keeps conversation state intact
     data = request.get_json(force=True)
     text = (data.get('message') or '').strip()
-
     stage = session.get('stage', 'ask_symptoms')
 
-    # Handle a suggestion confirmation step
+    # Handle suggestion confirmation
     if session.get('pending_suggestions'):
         sug = session['pending_suggestions']
-        # user can answer with index "1/2/3", exact word, or "skip"
         low = text.lower()
         chosen = None
         if low in ('skip', 'no'):
-            # ignore the unknown term and continue collecting
             session['pending_suggestions'] = []
             session['pending_term'] = None
             return jsonify({"message": "Okay, skipped. Add more symptoms or type 'done' when you're finished."})
-        if low in ('1','2','3'):
+        if low in ('1', '2', '3'):
             idx = int(low) - 1
             if 0 <= idx < len(sug):
                 chosen = sug[idx]
@@ -352,17 +351,14 @@ def api_message():
             session['pending_suggestions'] = []
             session['pending_term'] = None
             return jsonify({"message": f"Added: {chosen}. Add more symptoms or type 'done'."})
-        # If reply didn’t match, remind the user
-        return jsonify({"message": f"Please reply 1, 2, or 3; type the correct word; or 'skip'. Suggestions: {', '.join(f'{i+1}. {w}' for i,w in enumerate(sug))}"})
+        return jsonify({"message": f"Please reply 1, 2, or 3; type the correct word; or 'skip'. Suggestions: {', '.join(f'{i+1}. {w}' for i, w in enumerate(sug))}"})
 
     if stage == 'ask_symptoms':
-        # If user finished
         if text.lower() in ('done', 'finish', 'end', 'no'):
             if not session.get('symptoms'):
                 return jsonify({"message": "Please add at least one symptom before finishing."})
             session['stage'] = 'ask_name'
             return jsonify({"message": "Got it. What is your full name?"})
-
         tokens = parse_tokens(text)
         accepted = []
         for term in tokens:
@@ -375,8 +371,6 @@ def api_message():
                     session['pending_term'] = term
                     s_list = ", ".join([f"{i+1}. {w}" for i, w in enumerate(suggestions)])
                     return jsonify({"message": f"I didn’t recognize '{term}'. Did you mean: {s_list}? Reply 1/2/3, type the correct word, or 'skip'."})
-                # no suggestion – ignore quietly
-        # Save any accepted
         if accepted:
             syms = session.get('symptoms', [])
             for a in accepted:
@@ -415,10 +409,9 @@ def api_message():
         return jsonify({"message":
             f"Based on your symptoms, you may be experiencing: {cond}{proba_txt}.\n\n"
             f"Advice: {result['advice']}{extra}\n\n"
-            f"You can download a PDF summary or click Start over."
+            f"You can download a PDF or CSV summary, or click Start over."
         })
 
-    # Fallback
     return jsonify({"message": "Session completed. Click Start over to begin a new assessment."})
 
 # =============================
