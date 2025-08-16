@@ -283,27 +283,31 @@ GUIDE_HTML = """
 @app.route("/api/message", methods=["POST"])
 def api_message():
     user_message = request.json.get("message", "").strip()
-    if not user_message:
-        return jsonify({"message": "Please say something."})
+    stage = session.get("stage", "greet")
 
-    # Start a new conversation if no stage set
-    if "stage" not in session:
-        session.clear()
-        session["stage"] = "greet"
+    # --- Stage 1: Greeting ---
+    if stage == "greet":
+        session["stage"] = "ask_symptoms"
         return jsonify({
             "message": (
-                "Hello! I am your AI healthcare assistant 🤖. "
-                "This system was built by Bara'u Magaji, Aliyu Muhammad Abdul, "
-                "and Aliyu Biniyaminu.\n\n"
-                "Let's begin. How are you feeling today? Please list your symptoms, "
-                "separated by commas."
+                "Hello! 👋 I am your AI healthcare assistant.\n\n"
+                "This AI is built by **Bara'u Magaji, Aliyu Muhammad Abdul, "
+                "and Aliyu Biniyaminu.**\n\n"
+                "Please tell me how you feel by listing your symptoms "
+                "(separated by commas). When finished, type 'done'."
             )
         })
 
-    stage = session["stage"]
+    # --- Stage 2: Collect Symptoms ---
+    if stage == "ask_symptoms":
+        # Check if user is finished
+        if user_message.lower() in ("done", "finish", "end", "no"):
+            if not session.get("symptoms"):
+                return jsonify({"message": "I didn’t catch any valid symptoms. Please enter at least one."})
+            session["stage"] = "ask_name"
+            return jsonify({"message": "Got it ✅. What is your full name?"})
 
-    # --- Stage: Symptoms ---
-    if stage == "greet" or stage == "ask_symptoms":
+        # Parse possible symptoms
         tokens = [t.strip().lower() for t in user_message.split(",") if t.strip()]
         accepted, fallback = [], []
 
@@ -313,85 +317,75 @@ def api_message():
             else:
                 fallback.append(term)
 
-        # Store both recognized and unrecognized symptoms
+        # Store recognized symptoms
         syms = session.get("symptoms", [])
-        for t in accepted + fallback:
+        for t in accepted:
             if t not in syms:
                 syms.append(t)
         session["symptoms"] = syms
 
-        if user_message.lower() in ("done", "finish", "end", "no"):
-            if not session.get("symptoms"):
-                return jsonify({
-                    "message": "I didn’t catch any valid symptoms. Please enter at least one."
-                })
-            session["stage"] = "ask_name"
-            return jsonify({"message": "Got it. What is your full name?"})
-
-        # Feedback message
+        # Build response
         msg = ""
         if accepted:
             msg += f"Symptoms noted: {', '.join(accepted)}. "
         if fallback:
-            msg += f"(Not sure about: {', '.join(fallback)}). "
+            msg += f"(I didn’t recognize: {', '.join(fallback)}). "
         msg += "Add more or type 'done' when finished."
-        session["stage"] = "ask_symptoms"
         return jsonify({"message": msg})
 
-    # --- Stage: Name ---
-    elif stage == "ask_name":
+    # --- Stage 3: Ask Name ---
+    if stage == "ask_name":
         session["name"] = user_message
         session["stage"] = "ask_age"
-        return jsonify({"message": f"Thanks {user_message}. How old are you?"})
+        return jsonify({"message": f"Thanks, {user_message}. How old are you?"})
 
-    # --- Stage: Age ---
-    elif stage == "ask_age":
+    # --- Stage 4: Ask Age ---
+    if stage == "ask_age":
         try:
-            age = int(user_message)
+            session["age"] = int(user_message)
         except ValueError:
-            return jsonify({"message": "Please enter a valid number for age."})
-        session["age"] = age
-        session["stage"] = "ask_sex"
-        return jsonify({"message": "Got it. What is your gender? (Male/Female)"})
+            return jsonify({"message": "Please enter a valid age (numbers only)."})
+        session["stage"] = "ask_gender"
+        return jsonify({"message": "Great 👍. What is your gender (Male/Female)?"})
 
-    # --- Stage: Sex & Prediction ---
-    elif stage == "ask_sex":
-        sex = user_message.lower()
-        if sex not in ("male", "female"):
-            return jsonify({"message": "Please enter 'Male' or 'Female'."})
-        session["sex"] = sex
+    # --- Stage 5: Ask Gender ---
+    if stage == "ask_gender":
+        session["gender"] = user_message
+        session["stage"] = "predict"
+        return jsonify({"message": "Thank you. Processing your health data now... ⏳"})
 
-        # Run prediction
-        symptoms = session.get("symptoms", [])
-        preds = BUNDLE.predict(symptoms) if symptoms else None
+    # --- Stage 6: Prediction ---
+    if stage == "predict":
+        syms = session.get("symptoms", [])
+        preds = BUNDLE.predict(syms)
 
-        if preds:
-            disease, advice = preds
+        if not preds:
+            advice = "Sorry, I could not match your symptoms to a known condition. Please consult a doctor."
             session["stage"] = "done"
-            return jsonify({
-                "message": (
-                    f"Based on your symptoms, you may have **{disease}**.\n\n"
-                    f"Advice: {advice}\n\n"
-                    "Would you like to download your prescription as a PDF?"
-                )
-            })
-        else:
-            session["stage"] = "done"
-            return jsonify({
-                "message": (
-                    "I couldn’t make a clear prediction from the symptoms provided. "
-                    "Please consult a doctor for a proper checkup."
-                )
-            })
+            return jsonify({"message": advice})
 
-    # --- Stage: Done ---
-    elif stage == "done":
-        if "pdf" in user_message.lower():
-            # Trigger prescription PDF route
-            return jsonify({"message": "Here is your prescription PDF.", "pdf": "/download"})
-        return jsonify({"message": "Thank you for using CareGuide AI. Get well soon!"})
+        # Format prediction output
+        messages = []
+        for disease, info in preds:
+            desc = info.get("desc", "No description available.")
+            precs = info.get("precautions", [])
+            advice = info.get("advice", "Take care and monitor your symptoms.")
+            block = f"**{disease}**\nDescription: {desc}\nPrecautions: {', '.join(precs)}\nAdvice: {advice}"
+            messages.append(block)
 
-    return jsonify({"message": "Something went wrong. Let's start again."})
+        session["stage"] = "done"
+        return jsonify({
+            "message": "Here are the possible conditions based on your symptoms:\n\n" + "\n\n".join(messages) +
+                       "\n\nWould you like to download your prescription as a PDF?"
+        })
+
+    # --- Stage 7: Done ---
+    if stage == "done":
+        return jsonify({"message": "We have completed your diagnosis. Stay safe and healthy! 🌿"})
+
+    # Fallback
+    return jsonify({"message": "Something went wrong. Please restart."})
+
 
 
 # =============================
