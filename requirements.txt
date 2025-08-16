@@ -7,4 +7,4 @@ gunicorn
 werkzeug
 rapidfuzz
 flask_session
-scikit-learn
+scikit-learn==1.6.1
