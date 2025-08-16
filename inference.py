@@ -280,139 +280,119 @@ GUIDE_HTML = """
 # =============================
 # Routes
 # =============================
-
-@app.route('/')
-def home():
-    # Initialize only when visiting home
-    init_state()
-    return render_template_string(HOME_HTML)
-
-@app.route('/guidelines')
-def guidelines():
-    return render_template_string(GUIDE_HTML)
-
-@app.route('/api/boot')
-def api_boot():
-    # Initialize only when booting the chat
-    init_state()
-    session['stage'] = 'ask_symptoms'
-    msg = (
-        "Hello! I'm CareGuide AI.\n"
-        "Built by Bara'u Magaji, Aliyu Muhammad Abdul, and Aliyu Biniyaminu.\n\n"
-        "Describe your symptoms separated by commas (e.g., 'fever, cough'). "
-        "Type 'done' when finished."
-    )
-    return jsonify({"message": msg})
-
-@app.route('/api/restart', methods=['POST'])
-def api_restart():
-    reset_state()
-    return jsonify({"ok": True})
-
-# ---------- helpers ----------
-def parse_tokens(text: str) -> List[str]:
-    return [t.strip().lower() for t in text.replace(';', ',').split(',') if t.strip()]
-
-def suggest_terms(term: str) -> List[str]:
-    candidates = list(BUNDLE.symptom_index.keys())
-    if not candidates:
-        return []
-    matches = process.extract(term, candidates, limit=3, score_cutoff=65)
-    return [m[0] for m in matches]
-
-# ---------- conversation ----------
-@app.route('/api/message', methods=['POST'])
+@app.route("/api/message", methods=["POST"])
 def api_message():
-    # ❌ Removed init_state() here — keeps conversation state intact
-    data = request.get_json(force=True)
-    text = (data.get('message') or '').strip()
-    stage = session.get('stage', 'ask_symptoms')
+    user_message = request.json.get("message", "").strip()
+    if not user_message:
+        return jsonify({"message": "Please say something."})
 
-    # Handle suggestion confirmation
-    if session.get('pending_suggestions'):
-        sug = session['pending_suggestions']
-        low = text.lower()
-        chosen = None
-        if low in ('skip', 'no'):
-            session['pending_suggestions'] = []
-            session['pending_term'] = None
-            return jsonify({"message": "Okay, skipped. Add more symptoms or type 'done' when you're finished."})
-        if low in ('1', '2', '3'):
-            idx = int(low) - 1
-            if 0 <= idx < len(sug):
-                chosen = sug[idx]
-        elif low in [s.lower() for s in sug]:
-            chosen = low
-        if chosen:
-            syms = session.get('symptoms', [])
-            if chosen not in syms:
-                syms.append(chosen)
-            session['symptoms'] = syms
-            session['pending_suggestions'] = []
-            session['pending_term'] = None
-            return jsonify({"message": f"Added: {chosen}. Add more symptoms or type 'done'."})
-        return jsonify({"message": f"Please reply 1, 2, or 3; type the correct word; or 'skip'. Suggestions: {', '.join(f'{i+1}. {w}' for i, w in enumerate(sug))}"})
+    # Start a new conversation if no stage set
+    if "stage" not in session:
+        session.clear()
+        session["stage"] = "greet"
+        return jsonify({
+            "message": (
+                "Hello! I am your AI healthcare assistant 🤖. "
+                "This system was built by Bara'u Magaji, Aliyu Muhammad Abdul, "
+                "and Aliyu Biniyaminu.\n\n"
+                "Let's begin. How are you feeling today? Please list your symptoms, "
+                "separated by commas."
+            )
+        })
 
-    if stage == 'ask_symptoms':
-        if text.lower() in ('done', 'finish', 'end', 'no'):
-            if not session.get('symptoms'):
-                return jsonify({"message": "Please add at least one symptom before finishing."})
-            session['stage'] = 'ask_name'
-            return jsonify({"message": "Got it. What is your full name?"})
-        tokens = parse_tokens(text)
-        accepted = []
+    stage = session["stage"]
+
+    # --- Stage: Symptoms ---
+    if stage == "greet" or stage == "ask_symptoms":
+        tokens = [t.strip().lower() for t in user_message.split(",") if t.strip()]
+        accepted, fallback = [], []
+
         for term in tokens:
             if term in BUNDLE.symptom_index:
                 accepted.append(term)
             else:
-                suggestions = suggest_terms(term)
-                if suggestions:
-                    session['pending_suggestions'] = suggestions
-                    session['pending_term'] = term
-                    s_list = ", ".join([f"{i+1}. {w}" for i, w in enumerate(suggestions)])
-                    return jsonify({"message": f"I didn’t recognize '{term}'. Did you mean: {s_list}? Reply 1/2/3, type the correct word, or 'skip'."})
+                fallback.append(term)
+
+        # Store both recognized and unrecognized symptoms
+        syms = session.get("symptoms", [])
+        for t in accepted + fallback:
+            if t not in syms:
+                syms.append(t)
+        session["symptoms"] = syms
+
+        if user_message.lower() in ("done", "finish", "end", "no"):
+            if not session.get("symptoms"):
+                return jsonify({
+                    "message": "I didn’t catch any valid symptoms. Please enter at least one."
+                })
+            session["stage"] = "ask_name"
+            return jsonify({"message": "Got it. What is your full name?"})
+
+        # Feedback message
+        msg = ""
         if accepted:
-            syms = session.get('symptoms', [])
-            for a in accepted:
-                if a not in syms:
-                    syms.append(a)
-            session['symptoms'] = syms
-            return jsonify({"message": f"Symptoms noted: {', '.join(accepted)}. Add more or type 'done'."})
-        return jsonify({"message": "Thanks. Add more symptoms or type 'done' to proceed."})
+            msg += f"Symptoms noted: {', '.join(accepted)}. "
+        if fallback:
+            msg += f"(Not sure about: {', '.join(fallback)}). "
+        msg += "Add more or type 'done' when finished."
+        session["stage"] = "ask_symptoms"
+        return jsonify({"message": msg})
 
-    if stage == 'ask_name':
-        session.setdefault('patient', {})['name'] = text
-        session['stage'] = 'ask_age'
-        return jsonify({"message": f"Thanks {text}. How old are you?"})
+    # --- Stage: Name ---
+    elif stage == "ask_name":
+        session["name"] = user_message
+        session["stage"] = "ask_age"
+        return jsonify({"message": f"Thanks {user_message}. How old are you?"})
 
-    if stage == 'ask_age':
-        age_num = ''.join(ch for ch in text if ch.isdigit())
-        session['patient']['age'] = int(age_num) if age_num.isdigit() else None
-        session['stage'] = 'ask_sex'
-        return jsonify({"message": "What is your sex? (male/female/other)"})
+    # --- Stage: Age ---
+    elif stage == "ask_age":
+        try:
+            age = int(user_message)
+        except ValueError:
+            return jsonify({"message": "Please enter a valid number for age."})
+        session["age"] = age
+        session["stage"] = "ask_sex"
+        return jsonify({"message": "Got it. What is your gender? (Male/Female)"})
 
-    if stage == 'ask_sex':
-        session['patient']['sex'] = text.lower()
-        syms = session.get('symptoms', [])
-        result = BUNDLE.predict(syms)
-        session['last_result'] = {
-            "patient": session.get('patient', {}),
-            "symptoms": syms,
-            "result": result,
-            "timestamp": datetime.utcnow().isoformat() + "Z"
-        }
-        session['stage'] = 'done'
-        cond = result['condition']
-        proba_txt = f" (confidence {result['proba']:.0%})" if result['proba'] is not None else ""
-        precautions = result.get('precautions', [])
-        extra = ("\nPrecautions: " + ", ".join(precautions)) if precautions else ""
-        return jsonify({"message":
-            f"Based on your symptoms, you may be experiencing: {cond}{proba_txt}.\n\n"
-            f"Advice: {result['advice']}{extra}\n\n"
-            f"You can download a PDF or CSV summary, or click Start over."
-        })
+    # --- Stage: Sex & Prediction ---
+    elif stage == "ask_sex":
+        sex = user_message.lower()
+        if sex not in ("male", "female"):
+            return jsonify({"message": "Please enter 'Male' or 'Female'."})
+        session["sex"] = sex
 
-    return jsonify({"message": "Session completed. Click Start over to begin a new assessment."})
+        # Run prediction
+        symptoms = session.get("symptoms", [])
+        preds = BUNDLE.predict(symptoms) if symptoms else None
+
+        if preds:
+            disease, advice = preds
+            session["stage"] = "done"
+            return jsonify({
+                "message": (
+                    f"Based on your symptoms, you may have **{disease}**.\n\n"
+                    f"Advice: {advice}\n\n"
+                    "Would you like to download your prescription as a PDF?"
+                )
+            })
+        else:
+            session["stage"] = "done"
+            return jsonify({
+                "message": (
+                    "I couldn’t make a clear prediction from the symptoms provided. "
+                    "Please consult a doctor for a proper checkup."
+                )
+            })
+
+    # --- Stage: Done ---
+    elif stage == "done":
+        if "pdf" in user_message.lower():
+            # Trigger prescription PDF route
+            return jsonify({"message": "Here is your prescription PDF.", "pdf": "/download"})
+        return jsonify({"message": "Thank you for using CareGuide AI. Get well soon!"})
+
+    return jsonify({"message": "Something went wrong. Let's start again."})
+
 
 # =============================
 # Utility routes
