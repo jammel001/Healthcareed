@@ -280,23 +280,41 @@ GUIDE_HTML = """
 # =============================
 # Routes
 # =============================
-@app.route("/api/message", methods=["POST"])
-def api_message():
-    user_message = request.json.get("message", "").strip()
-    stage = session.get("stage", "greet")
+# =============================
+# Add these routes to your existing code
+# =============================
 
-    # --- Stage 1: Greeting ---
-    if stage == "greet":
-        session["stage"] = "ask_symptoms"
-        return jsonify({
-            "message": (
-                "Hello! 👋 I am your AI healthcare assistant.\n\n"
-                "This AI is built by **Bara'u Magaji, Aliyu Muhammad Abdul, "
-                "and Aliyu Biniyaminu.**\n\n"
-                "Please tell me how you feel by listing your symptoms "
-                "(separated by commas). When finished, type 'done'."
-            )
-        })
+@app.route("/")
+def home():
+    init_state()  # Initialize session if not exists
+    return render_template_string(HOME_HTML)
+
+@app.route("/guidelines")
+def guidelines():
+    return render_template_string(GUIDE_HTML)
+
+@app.route("/api/boot")
+def api_boot():
+    init_state()
+    return jsonify({
+        "message": (
+            "Hello! 👋 I am your AI healthcare assistant.\n\n"
+            "This AI is built by **Bara'u Magaji, Aliyu Muhammad Abdul, "
+            "and Aliyu Biniyaminu.**\n\n"
+            "Please tell me how you feel by listing your symptoms "
+            "(separated by commas). When finished, type 'done'."
+        )
+    })
+
+@app.route("/api/restart", methods=["POST"])
+def api_restart():
+    reset_state()
+    return jsonify({"ok": True})
+
+# =============================
+# Keep all your existing code below
+# =============================
+
 
     # --- Stage 2: Collect Symptoms ---
     if stage == "ask_symptoms":
