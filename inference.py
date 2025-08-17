@@ -293,117 +293,129 @@ def home():
 def guidelines():
     return render_template_string(GUIDE_HTML)
 
-@app.route("/api/boot")
-def api_boot():
-    init_state()
-    return jsonify({
-        "message": (
-            "Hello! 👋 I am your AI healthcare assistant.\n\n"
-            "This AI is built by **Bara'u Magaji, Aliyu Muhammad Abdul, "
-            "and Aliyu Biniyaminu.**\n\n"
-            "Please tell me how you feel by listing your symptoms "
-            "(separated by commas). When finished, type 'done'."
-        )
-    })
-
-@app.route("/api/restart", methods=["POST"])
-def api_restart():
-    reset_state()
-    return jsonify({"ok": True})
-
 # =============================
-# Keep all your existing code below
+# Routes (Add this decorator above your api_message function)
 # =============================
-
+@app.route("/api/message", methods=["POST"])
+def api_message():
+    user_message = request.json.get("message", "").strip()
+    stage = session.get("stage", "greet")
+    
+    # --- Stage 1: Greeting ---
+    if stage == "greet":
+        session["stage"] = "ask_symptoms"
+        session.modified = True
+        return jsonify({
+            "message": (
+                "Hello! 👋 I am your AI healthcare assistant.\n\n"
+                "Please list your symptoms (separated by commas).\n"
+                "Example: 'headache, fever, cough'\n\n"
+                "When finished, type 'done'."
+            )
+        })
 
     # --- Stage 2: Collect Symptoms ---
-    if stage == "ask_symptoms":
-        # Check if user is finished
+    elif stage == "ask_symptoms":
         if user_message.lower() in ("done", "finish", "end", "no"):
             if not session.get("symptoms"):
-                return jsonify({"message": "I didn’t catch any valid symptoms. Please enter at least one."})
+                return jsonify({"message": "Please enter at least one symptom before continuing."})
             session["stage"] = "ask_name"
+            session.modified = True
             return jsonify({"message": "Got it ✅. What is your full name?"})
 
-        # Parse possible symptoms
         tokens = [t.strip().lower() for t in user_message.split(",") if t.strip()]
-        accepted, fallback = [], []
+        accepted, unrecognized = [], []
 
         for term in tokens:
             if term in BUNDLE.symptom_index:
                 accepted.append(term)
             else:
-                fallback.append(term)
+                unrecognized.append(term)
 
         # Store recognized symptoms
-        syms = session.get("symptoms", [])
-        for t in accepted:
-            if t not in syms:
-                syms.append(t)
-        session["symptoms"] = syms
+        symptoms = session.get("symptoms", [])
+        symptoms.extend(accepted)
+        session["symptoms"] = list(set(symptoms))  # Remove duplicates
+        session.modified = True
 
-        # Build response
-        msg = ""
+        # Handle unrecognized symptoms
+        response_msg = ""
         if accepted:
-            msg += f"Symptoms noted: {', '.join(accepted)}. "
-        if fallback:
-            msg += f"(I didn’t recognize: {', '.join(fallback)}). "
-        msg += "Add more or type 'done' when finished."
-        return jsonify({"message": msg})
+            response_msg += f"✅ Added: {', '.join(accepted)}\n"
+        
+        if unrecognized:
+            # Get 3 closest matches for each unrecognized term
+            suggestions = {}
+            for term in unrecognized:
+                matches = process.extract(term, BUNDLE.symptom_index.keys(), limit=3)
+                suggestions[term] = [m[0] for m in matches]
+            
+            response_msg += "❌ Unrecognized (did you mean?):\n"
+            for term, options in suggestions.items():
+                response_msg += f" - '{term}': {', '.join(options)}\n"
+        
+        response_msg += "\nContinue adding symptoms or type 'done' to finish."
+        return jsonify({"message": response_msg})
 
     # --- Stage 3: Ask Name ---
-    if stage == "ask_name":
-        session["name"] = user_message
+    elif stage == "ask_name":
+        session["patient"] = {"name": user_message}
         session["stage"] = "ask_age"
+        session.modified = True
         return jsonify({"message": f"Thanks, {user_message}. How old are you?"})
 
     # --- Stage 4: Ask Age ---
-    if stage == "ask_age":
+    elif stage == "ask_age":
         try:
-            session["age"] = int(user_message)
+            age = int(user_message)
+            if not (0 < age < 120):
+                raise ValueError
+            session["patient"]["age"] = age
+            session["stage"] = "ask_gender"
+            session.modified = True
+            return jsonify({"message": "Got it. What is your gender? (Male/Female/Other)"})
         except ValueError:
-            return jsonify({"message": "Please enter a valid age (numbers only)."})
-        session["stage"] = "ask_gender"
-        return jsonify({"message": "Great 👍. What is your gender (Male/Female)?"})
+            return jsonify({"message": "Please enter a valid age (1-119)."})
 
     # --- Stage 5: Ask Gender ---
-    if stage == "ask_gender":
-        session["gender"] = user_message
+    elif stage == "ask_gender":
+        session["patient"]["gender"] = user_message
         session["stage"] = "predict"
-        return jsonify({"message": "Thank you. Processing your health data now... ⏳"})
+        session.modified = True
+        return jsonify({"message": "Analyzing your symptoms... Please wait ⏳"})
 
     # --- Stage 6: Prediction ---
-    if stage == "predict":
-        syms = session.get("symptoms", [])
-        preds = BUNDLE.predict(syms)
+    elif stage == "predict":
+        symptoms = session.get("symptoms", [])
+        result = BUNDLE.predict(symptoms)
+        
+        if result.get("condition") == "Model not loaded":
+            return jsonify({"message": "System error: Model failed to load. Please try again later."})
 
-        if not preds:
-            advice = "Sorry, I could not match your symptoms to a known condition. Please consult a doctor."
-            session["stage"] = "done"
-            return jsonify({"message": advice})
-
-        # Format prediction output
-        messages = []
-        for disease, info in preds:
-            desc = info.get("desc", "No description available.")
-            precs = info.get("precautions", [])
-            advice = info.get("advice", "Take care and monitor your symptoms.")
-            block = f"**{disease}**\nDescription: {desc}\nPrecautions: {', '.join(precs)}\nAdvice: {advice}"
-            messages.append(block)
-
+        # Store final result
+        session["last_result"] = {
+            "patient": session.get("patient", {}),
+            "symptoms": symptoms,
+            "result": result
+        }
         session["stage"] = "done"
-        return jsonify({
-            "message": "Here are the possible conditions based on your symptoms:\n\n" + "\n\n".join(messages) +
-                       "\n\nWould you like to download your prescription as a PDF?"
-        })
+        session.modified = True
+
+        # Format response
+        response = (
+            f"🔍 Likely Condition: {result['condition']}\n"
+            f"📊 Confidence: {result['proba']*100:.1f}%\n\n"
+            f"💡 Advice: {result['advice']}\n\n"
+            f"🛡️ Precautions:\n- " + "\n- ".join(result['precautions']) + "\n\n"
+            "You can download your prescription PDF now."
+        )
+        return jsonify({"message": response})
 
     # --- Stage 7: Done ---
-    if stage == "done":
-        return jsonify({"message": "We have completed your diagnosis. Stay safe and healthy! 🌿"})
+    elif stage == "done":
+        return jsonify({"message": "Session completed. Type 'restart' to begin again."})
 
-    # Fallback
-    return jsonify({"message": "Something went wrong. Please restart."})
-
+    return jsonify({"message": "System error. Please refresh the page."})
 
 
 # =============================
