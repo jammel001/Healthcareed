@@ -4,12 +4,13 @@ from typing import List, Dict, Any
 
 import numpy as np
 import joblib
-from flask import Flask, request, jsonify, send_file, session
+from flask import Flask, request, jsonify, send_file, render_template_string, session, redirect, url_for
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
+from rapidfuzz import process
 
 # =============================
 # App setup
@@ -31,9 +32,11 @@ class ModelBundle:
         self.symptom_index = model_dict.get('symptom_index', {}) or {}
         self.disease_index = model_dict.get('disease_index', {}) or {}
         self.disease_info = model_dict.get('disease_info', {}) or {}
+
+        # Optional embedding helper (not strictly needed for inference)
         self.vocab = list(symptom_embeddings.get('vocab', [])) if symptom_embeddings else []
         self.vectors = symptom_embeddings.get('vectors', None) if symptom_embeddings else None
-        if isinstance(self.vectors, np.ndarray) and self.vectors.size
+        if isinstance(self.vectors, np.ndarray) and self.vectors.size > 0:
             norms = np.linalg.norm(self.vectors, axis=1, keepdims=True)
             norms[norms == 0] = 1e-12
             self.vectors = self.vectors / norms
