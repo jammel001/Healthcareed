@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 
 from flask import (
-    Flask, request, jsonify, render_template_string, session, send_file, redirect, url_for
+    Flask, request, jsonify, render_template_string, session, send_file
 )
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -36,7 +36,6 @@ APP = Flask(__name__)
 CORS(APP)
 APP.wsgi_app = ProxyFix(APP.wsgi_app)
 APP.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-secret")
-# Session (persistent on filesystem by default; use redis in prod via env)
 APP.config['SESSION_TYPE'] = os.environ.get("SESSION_TYPE", "filesystem")
 APP.config['SESSION_FILE_DIR'] = './flask_session'
 APP.config['SESSION_PERMANENT'] = False
@@ -45,7 +44,7 @@ Session(APP)
 # Files & env
 MODEL_PKL = os.environ.get("MODEL_PKL", "model_tables.pkl")
 SYMPTOM_EMB = os.environ.get("SYMPTOM_EMB", "symptom_embeddings.npz")
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "change-this-admin-key")
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "JAFAR-123")
 DB_URL = os.environ.get("DATABASE_URL", "sqlite:///careguide.db")
 LOG_CSV = os.environ.get("LOG_CSV", "chat_logs.csv")
 
@@ -220,7 +219,6 @@ def _cache_set(key: str, value: Any):
 
 
 def fetch_healthfinder(condition: str) -> Dict[str, Any]:
-    # simple cached fetch; real API might differ; keep safe
     key = f"hf:{condition}"
     c = _cache_get(key)
     if c is not None:
@@ -263,7 +261,6 @@ def fetch_who_lookup(term: str) -> Dict[str, Any]:
     c = _cache_get(key)
     if c is not None:
         return c
-    # Placeholder: WHO APIs may require different endpoints
     res = {"message": "No WHO data (placeholder)"}
     _cache_set(key, res)
     return res
@@ -282,7 +279,6 @@ def check_urgent(symptoms: List[str]) -> bool:
     for k in URGENT_KEYWORDS:
         if k in sset:
             return True
-    # also check tokens
     for term in symptoms:
         for k in URGENT_KEYWORDS:
             if k in term.lower():
@@ -293,7 +289,6 @@ def check_urgent(symptoms: List[str]) -> bool:
 # Session helpers & init
 # ---------------------------
 def init_state():
-    # Only initialize if absent
     session.setdefault('stage', 'ask_symptoms')
     session.setdefault('symptoms', [])
     session.setdefault('pending_suggestions', [])
@@ -306,9 +301,8 @@ def reset_state():
     session.clear()
     init_state()
 
-
 # ---------------------------
-# Embedded UI (blue-white theme)
+# Embedded UI (blue-white theme) with inline checkbox suggestion panel
 # ---------------------------
 HOME_HTML = """
 <!doctype html>
@@ -323,7 +317,6 @@ body{font-family:Inter,system-ui,Arial; margin:0; background:var(--bg); color:va
 .header{display:flex;align-items:center;gap:12px}
 .logo{width:56px;height:56px;border-radius:8px;background:linear-gradient(135deg,#e6f0ff,#cfe6ff);display:flex;align-items:center;justify-content:center;font-weight:800;color:var(--accent)}
 .card{background:var(--card);border-radius:12px;padding:18px;box-shadow:0 6px 18px rgba(12,34,56,0.06)}
-.controls{display:flex;gap:8px;margin-top:12px}
 .chat{height:380px;overflow:auto;padding:12px;border-radius:8px;border:1px solid #e6eefb;background:#f7fbff}
 .msg{margin:8px 0;display:block}
 .ai{color:#052c4f;background:#eaf5ff;padding:8px;border-radius:8px;display:inline-block}
@@ -333,8 +326,8 @@ input[type="text"], textarea{flex:1;padding:10px;border-radius:8px;border:1px so
 button{background:var(--accent);color:white;padding:10px 12px;border-radius:8px;border:none;cursor:pointer}
 .small{background:transparent;border:1px solid #e6eefb;color:var(--accent);padding:8px 10px;border-radius:8px}
 .footer{margin-top:12px;color:var(--muted);font-size:13px}
-.switch{margin-left:auto}
-.badge{font-size:12px;background:#e6f0ff;color:var(--accent);padding:6px 8px;border-radius:999px}
+.suggestions{margin-top:8px;background:#fff;padding:8px;border-radius:8px;border:1px solid #e6eefb}
+.sugg-item{display:flex;align-items:center;gap:8px;padding:6px 4px}
 </style>
 </head>
 <body>
@@ -344,9 +337,6 @@ button{background:var(--accent);color:white;padding:10px 12px;border-radius:8px;
     <div>
       <h2 style="margin:0">B.Magaji — HealthChero</h2>
       <div style="font-size:13px;color:var(--muted)">Built by Bara'u Magaji & team — Chat or use Quick Form</div>
-    </div>
-    <div class="switch">
-      <button class="small" onclick="location.href='/guidelines'">Guidelines</button>
     </div>
   </div>
 
@@ -367,9 +357,19 @@ button{background:var(--accent);color:white;padding:10px 12px;border-radius:8px;
     <div id="chatArea" style="margin-top:12px">
       <div class="chat" id="chat"></div>
 
-      <div class="row" id="chatInputRow" style="margin-top:12px">
+      <div class="row" id="chatInputRow" style="margin-top:12px;align-items:center">
         <input id="chatInput" placeholder="Describe how you feel (e.g., fever, sore throat)" />
         <button onclick="sendChat()">Send</button>
+      </div>
+
+      <!-- Inline suggestion panel (appears when backend returns suggestions) -->
+      <div id="suggestPanel" class="suggestions" style="display:none">
+        <div id="suggestTitle" style="font-weight:700;margin-bottom:6px">Please confirm which apply:</div>
+        <div id="suggestList"></div>
+        <div style="margin-top:8px">
+          <button onclick="confirmSuggestions()">Add Selected</button>
+          <button onclick="skipSuggestions()" class="small">Skip</button>
+        </div>
       </div>
     </div>
 
@@ -393,26 +393,11 @@ button{background:var(--accent);color:white;padding:10px 12px;border-radius:8px;
     <div class="footer">This tool provides informational guidance only — not a medical diagnosis. In emergencies call local emergency services.</div>
   </div>
 
-  <div style="height:18px"></div>
-  <div style="display:flex;gap:12px">
-    <div class="card" style="flex:1">
-      <h4 style="margin-top:0">Actions</h4>
-      <div style="display:flex;gap:8px"><button onclick="downloadLast('simple')">Download Simple PDF</button><button onclick="downloadLast('professional')">Download Professional PDF</button></div>
-      <div style="margin-top:8px"><button onclick="downloadCSV()">Admin: Download CSV</button></div>
-    </div>
-    <div class="card" style="width:320px">
-      <h4 style="margin-top:0">Login (optional)</h4>
-      <input id="li_email" placeholder="Email" style="width:100%;margin-bottom:6px"/>
-      <input id="li_pass" placeholder="Password" type="password" style="width:100%;margin-bottom:6px"/>
-      <div style="display:flex;gap:8px"><button onclick="login()">Login</button><button class="small" onclick="signup()">Sign up</button></div>
-      <div id="authMsg" style="font-size:12px;color:#555;margin-top:6px"></div>
-    </div>
-  </div>
-
 </div>
 
 <script>
 let mode = 'chat';
+let pendingSuggestions = [];  // array of strings from backend
 function setMode(m){
   mode = m;
   document.getElementById('chatArea').style.display = (m==='chat'?'block':'none');
@@ -421,10 +406,6 @@ function setMode(m){
   document.getElementById('btnForm').disabled = (m==='form');
 }
 
-async function boot(){
-  await fetch('/api/boot');
-  appendAI("Hello! Describe your symptoms (e.g., fever, cough). Use 'done' when finished or use Quick Form.");
-}
 function appendAI(txt){
   const d=document.createElement('div'); d.className='msg ai'; d.textContent=txt; document.getElementById('chat').appendChild(d); document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
 }
@@ -432,13 +413,70 @@ function appendUser(txt){
   const d=document.createElement('div'); d.className='msg user'; d.textContent=txt; document.getElementById('chat').appendChild(d); document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
 }
 
+async function boot(){
+  await fetch('/api/boot');
+  appendAI("Hello! Describe your symptoms (e.g., fever, cough). Use 'done' when finished or use Quick Form.");
+}
+
 async function sendChat(){
   const v = document.getElementById('chatInput').value.trim();
   if(!v) return;
   appendUser(v); document.getElementById('chatInput').value='';
+  // hide any lingering suggestion panel until we get new response
+  hideSuggestionPanel();
   const r = await fetch('/api/message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:v})});
   const j = await r.json();
+  // If backend returned suggestions, render inline checkbox panel
+  if(j.suggestions && j.suggestions.length){
+    pendingSuggestions = j.suggestions.slice(0,3); // show up to 3
+    renderSuggestionPanel(pendingSuggestions, j.original_term || "");
+    appendAI(j.message); // AI message that said "I didn't recognize..."
+  } else {
+    appendAI(j.message);
+    pendingSuggestions = [];
+    hideSuggestionPanel();
+  }
+}
+
+function renderSuggestionPanel(list, original_term){
+  const panel = document.getElementById('suggestPanel');
+  const container = document.getElementById('suggestList');
+  container.innerHTML = '';
+  list.forEach((s, idx) => {
+    const id = 'sugg_'+idx;
+    const div = document.createElement('div');
+    div.className = 'sugg-item';
+    div.innerHTML = `<input type="checkbox" id="${id}" value="${s}" /><label for="${id}">${s}</label>`;
+    container.appendChild(div);
+  });
+  panel.style.display = 'block';
+}
+
+function hideSuggestionPanel(){
+  document.getElementById('suggestPanel').style.display = 'none';
+  document.getElementById('suggestList').innerHTML = '';
+  pendingSuggestions = [];
+}
+
+async function confirmSuggestions(){
+  const checks = Array.from(document.querySelectorAll('#suggestList input[type="checkbox"]'));
+  const selected = checks.filter(c=>c.checked).map(c=>c.value);
+  if(selected.length === 0){
+    // nothing selected -> treat as skip
+    await skipSuggestions();
+    return;
+  }
+  // send selections to backend
+  const r = await fetch('/api/confirm-suggestions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({selected})});
+  const j = await r.json();
+  hideSuggestionPanel();
   appendAI(j.message);
+}
+
+async function skipSuggestions(){
+  await fetch('/api/skip-suggestions',{method:'POST'});
+  hideSuggestionPanel();
+  appendAI("Okay — skipped that term. Add more symptoms or type 'done'.");
 }
 
 async function submitForm(e){
@@ -457,32 +495,6 @@ async function restart(){
   await fetch('/api/restart',{method:'POST'});
   document.getElementById('chat').innerHTML='';
   boot();
-}
-
-async function login(){
-  const email = document.getElementById('li_email').value;
-  const pass = document.getElementById('li_pass').value;
-  const r = await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email, password:pass})});
-  const j = await r.json();
-  document.getElementById('authMsg').textContent = j.message || JSON.stringify(j);
-}
-
-async function signup(){
-  const email = document.getElementById('li_email').value;
-  const pass = document.getElementById('li_pass').value;
-  const r = await fetch('/api/signup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email, password:pass})});
-  const j = await r.json();
-  document.getElementById('authMsg').textContent = j.message || JSON.stringify(j);
-}
-
-async function downloadLast(style){
-  window.location.href = `/download_pdf?style=${style}`;
-}
-
-async function downloadCSV(){
-  const key = prompt("Admin key (required):");
-  if(!key) return;
-  window.location.href = `/download_csv?admin_key=${encodeURIComponent(key)}`;
 }
 
 boot();
@@ -541,7 +553,6 @@ def login():
     user = db.query(User).filter_by(email=email).first()
     if not user or not check_password_hash(user.password_hash, password):
         return jsonify({"ok": False, "message": "Invalid credentials"}), 401
-    # store user id in session
     session['user_id'] = user.id
     session['user_email'] = user.email
     session['user_name'] = user.display_name
@@ -561,7 +572,6 @@ def logout():
 # ---------------------------
 @APP.route('/api/boot')
 def api_boot():
-    # initialize conversation once
     reset_state()
     session['stage'] = 'ask_symptoms'
     return jsonify({"message": "Hello! I'm HealthChero (B.Magaji). Describe your symptoms separated by commas, or use the Quick Form."})
@@ -584,17 +594,17 @@ def api_message():
     text = (data.get('message') or '').strip()
     stage = session.get('stage', 'ask_symptoms')
 
-    # handle pending suggestions (user chose 1/2/3 or typed yes/no)
+    # handle pending suggestion reply first (should be handled by confirm-suggestions endpoints)
     if session.get('pending_suggestions'):
+        # If pending then user must use the inline UI; but we allow typed numeric responses too.
         suggestions = session.get('pending_suggestions') or []
         low = text.lower().strip()
-        if low in ('skip', 'no'):
+        if low in ('skip','no'):
             session['pending_suggestions'] = []
             session['pending_term'] = None
             return jsonify({"message": "Okay, skipped that term. Add more symptoms or type 'done'."})
-        # numeric choices
-        if low in ('1', '2', '3'):
-            idx = int(low) - 1
+        if low in ('1','2','3'):
+            idx = int(low)-1
             if 0 <= idx < len(suggestions):
                 chosen = suggestions[idx]
                 syms = session.get('symptoms', [])
@@ -604,7 +614,6 @@ def api_message():
                 session['pending_suggestions'] = []
                 session['pending_term'] = None
                 return jsonify({"message": f"Added: {chosen}. Add more or type 'done'."})
-        # typed exact suggestion
         for s in suggestions:
             if low == s.lower():
                 syms = session.get('symptoms', [])
@@ -614,7 +623,7 @@ def api_message():
                 session['pending_suggestions'] = []
                 session['pending_term'] = None
                 return jsonify({"message": f"Added: {s}. Add more or type 'done'."})
-        return jsonify({"message": f"Please reply 1/2/3, type the correct word, or 'skip'. Suggestions: {', '.join([f'{i+1}. {w}' for i,w in enumerate(suggestions)])}"})
+        # otherwise fall through to normal handling
 
     # main state machine
     if stage == 'ask_symptoms':
@@ -623,29 +632,35 @@ def api_message():
                 return jsonify({"message": "Please add at least one symptom before finishing."})
             session['stage'] = 'ask_name'
             return jsonify({"message": "Got it. Please enter patient name (optional) or type 'skip'."})
+
         tokens = parse_tokens(text)
         if not tokens:
             return jsonify({"message": "Please describe your symptoms (comma separated) or use Quick Form."})
+
         added = []
         for term in tokens:
             if term in BUNDLE.symptom_index:
                 if term not in session['symptoms']:
                     session['symptoms'].append(term); added.append(term)
             else:
+                # produce up-to-3 fuzzy suggestions and hold pending state
                 suggestions = fuzzy_suggest(term, limit=3, cutoff=60)
                 if suggestions:
                     session['pending_suggestions'] = suggestions
                     session['pending_term'] = term
-                    s_list = ", ".join([f"{i+1}. {w}" for i, w in enumerate(suggestions)])
-                    return jsonify({"message": f"I didn't recognize '{term}'. Did you mean: {s_list}? Reply 1/2/3, type the correct word, or 'skip'."})
-                # otherwise ignore unknown token quietly
+                    # return suggestions to frontend; the frontend will render checkbox panel
+                    return jsonify({
+                        "message": f"I didn't recognize '{term}'. Please confirm from the suggestions below.",
+                        "suggestions": suggestions,
+                        "original_term": term
+                    })
+                # ignore unknown without suggestions
         if added:
             return jsonify({"message": f"Symptoms noted: {', '.join(added)}. Add more or type 'done'."})
         return jsonify({"message": "Thanks. Add more symptoms or type 'done' to proceed."})
 
     if stage == 'ask_name':
         if text.lower() not in ('skip','none','n/a',''):
-            # only save name in session (not stored in DB per your Q2=A)
             session['patient']['name'] = text
         session['stage'] = 'ask_age'
         return jsonify({"message": "Age? (optional) or type 'skip'."})
@@ -661,12 +676,11 @@ def api_message():
     if stage == 'ask_sex':
         if text.lower() not in ('skip','none','n/a',''):
             session['patient']['sex'] = text.lower()
-        # now compute
         symptoms_entered = session.get('symptoms', [])[:]
         matched = BUNDLE.match_symptoms(symptoms_entered)
         result = BUNDLE.predict(matched)
         urgent = check_urgent(matched + symptoms_entered)
-        # save minimal assessment in DB (Q2=A)
+
         db = DBSession()
         ass = Assessment(
             user_id=session.get('user_id'),
@@ -688,7 +702,7 @@ def api_message():
             "matched": matched
         }
         session['stage'] = 'done'
-        proba_txt = f" (confidence {result['proba']:.0%})" if result.get('proba') else ""
+        proba_txt = f" (confidence {result.get('proba'):.0%})" if result.get('proba') else ""
         extras = ""
         if result.get('precautions'):
             extras = "\nPrecautions: " + ", ".join(result.get('precautions'))
@@ -697,9 +711,32 @@ def api_message():
             urgent_msg = "\n\n⚠️ URGENT: Your symptoms include red-flag items. Seek emergency care immediately if severe."
         return jsonify({"message": f"Based on your symptoms, possible: {result.get('condition')}{proba_txt}.\nAdvice: {result.get('advice')}{extras}{urgent_msg}\nYou can download a PDF or type 'start over'."})
 
-    # completed
     return jsonify({"message": "Session complete. Click Start Over to run a new assessment."})
 
+# Endpoint to accept checkbox-confirmed suggestions (multi-select)
+@APP.route('/api/confirm-suggestions', methods=['POST'])
+def api_confirm_suggestions():
+    init_state()
+    data = request.json or {}
+    selected = data.get('selected', []) or []
+    if not selected:
+        return jsonify({"ok": False, "message": "No selection provided."}), 400
+    syms = session.get('symptoms', [])
+    for s in selected:
+        if s not in syms:
+            syms.append(s)
+    session['symptoms'] = syms
+    # clear pending suggestions so flow can continue
+    session['pending_suggestions'] = []
+    session['pending_term'] = None
+    return jsonify({"ok": True, "message": f"Added: {', '.join(selected)}. Add more or type 'done'."})
+
+# Endpoint to skip current suggestions
+@APP.route('/api/skip-suggestions', methods=['POST'])
+def api_skip_suggestions():
+    session['pending_suggestions'] = []
+    session['pending_term'] = None
+    return jsonify({"ok": True})
 
 # Quick form handler that mirrors form-based flow
 @APP.route('/api/diagnose-form', methods=['POST'])
@@ -721,7 +758,6 @@ def api_diagnose_form():
             session['patient']['age'] = int(digits)
     if sex:
         session['patient']['sex'] = sex.lower()
-    # perform prediction like above
     matched = BUNDLE.match_symptoms(tokens)
     result = BUNDLE.predict(matched)
     urgent = check_urgent(matched + tokens)
@@ -742,13 +778,13 @@ def api_diagnose_form():
     db.add(ass); db.commit()
     session['last_result'] = {"assessment_id": ass.id, "result": result, "matched": matched}
     session['stage'] = 'done'
-    proba_txt = f" (confidence {result['proba']:.0%})" if result.get('proba') else ""
+    proba_txt = f" (confidence {result.get('proba'):.0%})" if result.get('proba') else ""
     urgent_msg = "\n\n⚠️ URGENT: Seek emergency care if symptoms severe." if urgent else ""
     return jsonify({"message": f"Quick result: {result.get('condition')}{proba_txt}. Advice: {result.get('advice')}{urgent_msg}"})
 
 
 # ---------------------------
-# Downloads & admin
+# Downloads & admin (unchanged)
 # ---------------------------
 def make_pdf_simple(assessment: Assessment):
     buf = io.BytesIO()
@@ -826,7 +862,6 @@ def download_csv():
     key = request.args.get('admin_key') or ''
     if not key or key != ADMIN_KEY:
         return "Unauthorized", 403
-    # produce CSV of assessments
     db = DBSession()
     rows = db.query(Assessment).order_by(Assessment.created_at.desc()).all()
     buf = io.StringIO()
@@ -845,9 +880,8 @@ def download_csv():
 def health():
     return jsonify({"status":"ok","model_loaded": bool(MODEL_DICT), "embeddings_loaded": bool(SYM_EMB)})
 
+# expose 'app' variable so gunicorn inference:app works
+app = APP
 
-# ---------------------------
-# Run
-# ---------------------------
 if __name__ == "__main__":
-    APP.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=False)
